@@ -1,204 +1,266 @@
 #!/bin/bash
 
-# ========================
-# 一键安装 WireGuard + VLESS (xtls-rprx-vision) + XTLS + QUIC
-# ========================
+# 定义颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PLAIN='\033[0m'
 
-# 设置必要变量
-SERVER_IP=$(curl -s ifconfig.me)  # 获取服务器外网IP
-WG_PORT=51820                    # WireGuard 端口
-VLESS_PORT=443                   # VLESS 端口 (通常使用443作为HTTPS端口)
-QUIC_KEY=$(openssl rand -base64 32)  # 随机生成 QUIC key
-VLESS_UUID=$(cat /proc/sys/kernel/random/uuid)  # 随机生成 UUID
-CERT_DIR="/etc/xray"             # XTLS 证书存放路径
-CERT_FILE="$CERT_DIR/certificate.crt"
-KEY_FILE="$CERT_DIR/private.key"
+# 检查root权限
+[[ $EUID -ne 0 ]] && echo -e "${RED}请使用 root 用户运行此脚本！${PLAIN}" && exit 1
 
-# 所需开放的端口
-REQUIRED_PORTS=("51820" "443")
+# 系统检测
+OS_ARCH=$(uname -m)
+case $OS_ARCH in
+    x86_64|amd64)
+        OS_ARCH="amd64"
+        ;;
+    arm64|aarch64)
+        OS_ARCH="arm64"
+        ;;
+    *)
+        echo -e "${RED}不支持的系统架构: ${OS_ARCH}${PLAIN}"
+        exit 1
+        ;;
+esac
 
-# 检查端口是否已开放
-check_and_open_ports() {
-    for PORT in "${REQUIRED_PORTS[@]}"; do
-        if ! netstat -tuln | grep -q ":$PORT"; then
-            echo "端口 $PORT 未开放，正在尝试打开该端口..."
-            ufw allow $PORT
-        else
-            echo "端口 $PORT 已开放。"
-        fi
-    done
-}
-
-# 安装 WireGuard
-install_wireguard() {
-    echo "安装 WireGuard ..."
-    apt update && apt upgrade -y
-    apt install -y wireguard
-}
-
-# 安装 Xray
-install_xray() {
-    echo "安装 Xray ..."
-    bash <(curl -s -L https://github.com/XTLS/Xray-install/releases/latest/download/install-release.sh)
-}
-
-# 配置 WireGuard
-configure_wireguard() {
-    echo "配置 WireGuard ..."
-    mkdir -p /etc/wireguard
-    wg genkey | tee /etc/wireguard/private.key | wg pubkey > /etc/wireguard/public.key
-    local private_key=$(cat /etc/wireguard/private.key)
-    local public_key=$(cat /etc/wireguard/public.key)
-    
-    cat > /etc/wireguard/wg0.conf <<EOF
-[Interface]
-PrivateKey = $private_key
-Address = 10.0.0.1/24
-ListenPort = $WG_PORT
-
-[Peer]
-PublicKey = $public_key
-AllowedIPs = 10.0.0.2/32
-EOF
-
-    wg-quick up wg0
-    systemctl enable wg-quick@wg0
-}
-
-# 获取证书 (如果使用 Let's Encrypt)
-get_lets_encrypt_cert() {
-    echo "获取 Let's Encrypt 证书 ..."
-    
-    # 让用户输入域名和邮件
-    for i in {1..3}; do
-        read -p "请输入用于申请证书的域名: " DOMAIN
-        read -p "请输入您的电子邮件地址: " EMAIL
-
-        # 验证域名格式
-        if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-            echo "域名格式不正确，请重新输入。"
-            continue
-        fi
-
-        # 验证邮件格式
-        if [[ ! "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}$ ]]; then
-            echo "邮件格式不正确，请重新输入。"
-            continue
-        fi
-
-        # 进行 Let's Encrypt 证书申请
-        certbot certonly --standalone -d "$DOMAIN" --agree-tos --no-eff-email --email "$EMAIL"
-        
-        if [[ $? -eq 0 ]]; then
-            # 复制证书
-            cp /etc/letsencrypt/live/$DOMAIN/fullchain.pem $CERT_FILE
-            cp /etc/letsencrypt/live/$DOMAIN/privkey.pem $KEY_FILE
-            echo "证书获取成功!"
-            break
-        else
-            echo "证书申请失败，请检查域名和邮件地址，或者稍后再试。"
-        fi
-
-        # 如果连续 3 次失败，停止脚本
-        if [[ $i -eq 3 ]]; then
-            echo "输入错误超过三次，脚本终止执行。"
-            exit 1
-        fi
-    done
-}
-
-# 配置 Xray + VLESS + XTLS + QUIC
-configure_xray() {
-    echo "配置 Xray 服务 ..."
-
-    # 创建配置目录
-    mkdir -p $CERT_DIR
-
-    # 生成 Xray 配置文件
-    cat > /etc/xray/config.json <<EOF
-{
-  "inbounds": [
-    {
-      "port": $VLESS_PORT,
-      "listen": "0.0.0.0",
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$VLESS_UUID",
-            "alterId": 0,
-            "level": 1
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "quic",
-        "quicSettings": {
-          "key": "$QUIC_KEY",
-          "security": "none"
-        },
-        "xtlsSettings": {
-          "flow": "xtls-rprx-vision",
-          "certificates": [
-            {
-              "certificateFile": "$CERT_FILE",
-              "keyFile": "$KEY_FILE"
-            }
-          ]
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {}
-    }
-  ]
-}
-EOF
-
-    # 启动 Xray 服务
-    systemctl restart xray
-    systemctl enable xray
-}
-
-# 生成订阅链接
-generate_subscribe_link() {
-    echo "生成订阅链接 ..."
-
-    # 创建订阅链接
-    SUBSCRIBE_URL="vless://$VLESS_UUID@$SERVER_IP:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SERVER_IP&fp=chrome&pbk=5crdaiZoni_05bh1iZKDgIbiqBH7y0vlBiqbkEcx8ms&sid=725f8cc2&type=quic&headerType=none#vless-quic-link"
-
-    echo "订阅链接生成完毕！"
-    echo "VLESS 订阅链接: $SUBSCRIBE_URL"
-}
-
-# 安装依赖
-install_dependencies() {
-    apt install -y curl wget lsof iptables ufw
-}
-
-# 主执行函数
-main() {
-    install_dependencies
-    check_and_open_ports
-    install_wireguard
-    install_xray
-    configure_wireguard
-
-    # 提示是否使用 Let's Encrypt 获取证书
-    read -p "是否需要使用 Let's Encrypt 获取证书？(y/n): " USE_LETS_ENCRYPT
-    if [[ "$USE_LETS_ENCRYPT" == "y" ]]; then
-        get_lets_encrypt_cert
-    else
-        echo "请手动上传证书到 $CERT_DIR 目录。"
+# 安装基础工具
+install_base() {
+    if [[ -f /etc/debian_version ]]; then
+        apt update -y
+        apt install -y wget curl tar unzip vim jq qrencode net-tools
+    elif [[ -f /etc/redhat-release ]]; then
+        yum install -y wget curl tar unzip vim jq qrencode net-tools
     fi
-
-    configure_xray
-    generate_subscribe_link
 }
 
-# 运行脚本
+# 获取最新版本的sing-box
+get_latest_version() {
+    echo $(curl -Ls "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+}
+
+# 安装sing-box
+install_singbox() {
+    VERSION=$(get_latest_version)
+    DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/${VERSION}/sing-box-${VERSION/v/}-linux-${OS_ARCH}.tar.gz"
+    
+    wget -q ${DOWNLOAD_URL} -O sing-box.tar.gz
+    tar -xzf sing-box.tar.gz
+    mv sing-box-*/sing-box /usr/local/bin/
+    chmod +x /usr/local/bin/sing-box
+    
+    mkdir -p /usr/local/etc/sing-box
+    mkdir -p /var/log/sing-box
+    
+    rm -rf sing-box.tar.gz sing-box-*
+}
+
+# 生成配置文件
+create_config() {
+    local vmess_port=$(shuf -i 10000-65535 -n 1)
+    local uuid=$(sing-box generate uuid)
+    local domain
+    
+    echo -e "${YELLOW}请输入您的域名：${PLAIN}"
+    read -p "Domain: " domain
+    
+    cat > /usr/local/etc/sing-box/config.json << EOF
+{
+    "log": {
+        "level": "info",
+        "timestamp": true,
+        "output": "/var/log/sing-box/sing-box.log"
+    },
+    "inbounds": [
+        {
+            "type": "vmess",
+            "tag": "vmess-in",
+            "listen": "::",
+            "listen_port": ${vmess_port},
+            "users": [
+                {
+                    "uuid": "${uuid}",
+                    "alterId": 0
+                }
+            ],
+            "transport": {
+                "type": "ws",
+                "path": "/vmess",
+                "max_early_data": 2048,
+                "early_data_header_name": "Sec-WebSocket-Protocol"
+            },
+            "tls": {
+                "enabled": true,
+                "server_name": "${domain}",
+                "certificate_path": "/usr/local/etc/sing-box/cert.pem",
+                "key_path": "/usr/local/etc/sing-box/key.pem",
+                "xtls": {
+                    "enabled": true,
+                    "vision": true
+                }
+            },
+            "multiplex": {
+                "enabled": true,
+                "padding": true,
+                "brutal": {
+                    "enabled": true,
+                    "up_mbps": 100,
+                    "down_mbps": 100
+                }
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "direct",
+            "tag": "direct"
+        },
+        {
+            "type": "block",
+            "tag": "block"
+        }
+    ]
+}
+EOF
+    
+    echo -e "${GREEN}配置文件已生成${PLAIN}"
+}
+
+# 申请证书
+install_cert() {
+    local domain=$1
+    
+    # 安装 acme.sh
+    curl https://get.acme.sh | sh
+    
+    # 关闭可能占用80端口的服务
+    systemctl stop nginx || true
+    systemctl stop apache2 || true
+    
+    # 申请证书
+    ~/.acme.sh/acme.sh --issue -d ${domain} --standalone -k ec-256
+    
+    # 安装证书到 sing-box 目录
+    ~/.acme.sh/acme.sh --install-cert -d ${domain} \
+        --key-file /usr/local/etc/sing-box/key.pem \
+        --fullchain-file /usr/local/etc/sing-box/cert.pem \
+        --ecc
+        
+    # 设置权限
+    chmod 644 /usr/local/etc/sing-box/cert.pem
+    chmod 644 /usr/local/etc/sing-box/key.pem
+    
+    echo -e "${GREEN}证书安装完成${PLAIN}"
+}
+
+# 创建systemd服务
+create_service() {
+    cat > /etc/systemd/system/sing-box.service << EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+WorkingDirectory=/usr/local/etc/sing-box
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable sing-box
+    systemctl start sing-box
+    
+    echo -e "${GREEN}sing-box 服务已创建并启动${PLAIN}"
+}
+
+# 显示配置信息
+show_config() {
+    local domain=$1
+    local vmess_port=$(jq -r '.inbounds[0].listen_port' /usr/local/etc/sing-box/config.json)
+    local uuid=$(jq -r '.inbounds[0].users[0].uuid' /usr/local/etc/sing-box/config.json)
+    
+    echo -e "\n${GREEN}=== sing-box 配置信息 ===${PLAIN}"
+    echo -e "${YELLOW}域名：${PLAIN}${domain}"
+    echo -e "${YELLOW}端口：${PLAIN}${vmess_port}"
+    echo -e "${YELLOW}UUID：${PLAIN}${uuid}"
+    echo -e "${YELLOW}传输协议：${PLAIN}WebSocket"
+    echo -e "${YELLOW}WebSocket路径：${PLAIN}/vmess"
+    echo -e "${YELLOW}XTLS：${PLAIN}开启 (Vision)"
+    echo -e "${YELLOW}多路复用：${PLAIN}开启"
+    
+    # 生成 VMess 链接
+    local config="{\"v\":\"2\",\"ps\":\"sing-box-vmess-xtls\",\"add\":\"${domain}\",\"port\":${vmess_port},\"id\":\"${uuid}\",\"aid\":0,\"net\":\"ws\",\"path\":\"/vmess\",\"type\":\"none\",\"host\":\"${domain}\",\"tls\":\"xtls\",\"flow\":\"xtls-rprx-vision\"}"
+    local vmess_link="vmess://$(echo -n ${config} | base64 -w 0)"
+    
+    echo -e "\n${YELLOW}VMess 链接：${PLAIN}\n${vmess_link}\n"
+    
+    # 生成二维码
+    echo -e "${YELLOW}VMess 二维码：${PLAIN}"
+    echo -n "${vmess_link}" | qrencode -t UTF8
+    
+    # 显示服务状态
+    echo -e "\n${YELLOW}sing-box 运行状态：${PLAIN}"
+    systemctl status sing-box --no-pager
+    
+    echo -e "\n${YELLOW}管理命令：${PLAIN}"
+    echo -e "启动：systemctl start sing-box"
+    echo -e "停止：systemctl stop sing-box"
+    echo -e "重启：systemctl restart sing-box"
+    echo -e "状态：systemctl status sing-box"
+    echo -e "查看日志：journalctl -u sing-box -f"
+}
+
+# 清理安装
+clean_install() {
+    systemctl stop sing-box >/dev/null 2>&1
+    systemctl disable sing-box >/dev/null 2>&1
+    rm -rf /usr/local/bin/sing-box
+    rm -rf /usr/local/etc/sing-box
+    rm -rf /etc/systemd/system/sing-box.service
+    systemctl daemon-reload
+}
+
+# 主函数
+main() {
+    echo -e "${BLUE}开始安装 sing-box...${PLAIN}"
+    
+    # 清理旧安装
+    clean_install
+    
+    # 安装基础工具
+    install_base
+    
+    # 安装sing-box
+    install_singbox
+    
+    # 创建配置
+    create_config
+    
+    # 获取域名
+    local domain=$(jq -r '.inbounds[0].tls.server_name' /usr/local/etc/sing-box/config.json)
+    
+    # 安装证书
+    install_cert ${domain}
+    
+    # 创建服务
+    create_service
+    
+    # 显示配置信息
+    show_config ${domain}
+}
+
+# 运行主函数
 main
+
+exit 0
